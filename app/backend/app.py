@@ -5,6 +5,7 @@ import logging
 import mimetypes
 import os
 import time
+import uuid
 from collections.abc import AsyncGenerator, Awaitable
 from pathlib import Path
 from typing import Any, Callable, Union, cast
@@ -187,8 +188,12 @@ async def ask(auth_claims: dict[str, Any]):
     context["auth_claims"] = auth_claims
     try:
         approach: Approach = cast(Approach, current_app.config[CONFIG_ASK_APPROACH])
+        
+        # Preprocess messages to handle new array content format
+        processed_messages = preprocess_messages(request_json["messages"])
+        
         r = await approach.run(
-            request_json["messages"], context=context, session_state=request_json.get("session_state")
+            processed_messages, context=context, session_state=request_json.get("session_state")
         )
         return jsonify(r)
     except Exception as error:
@@ -204,8 +209,62 @@ class JSONEncoder(json.JSONEncoder):
 
 async def format_as_ndjson(r: AsyncGenerator[dict, None]) -> AsyncGenerator[str, None]:
     try:
+        all_events = []
+        choices_objects = []
+        
+        # Collect all events first
         async for event in r:
-            yield json.dumps(event, ensure_ascii=False, cls=JSONEncoder) + "\n"
+            all_events.append(event)
+            
+            # If this event has delta content, create a choices object
+            if "delta" in event and event["delta"].get("content"):
+                delta_content = event["delta"]["content"]
+                choices_objects.append(delta_content)
+        
+        # Start the JSON array
+        yield "[\n"
+        
+        # First, yield all the original delta events
+        for i, event in enumerate(all_events):
+            if i > 0:
+                yield ",\n"
+            yield json.dumps(event, ensure_ascii=False, cls=JSONEncoder)
+        
+        # Generate shared values for all choices objects
+        shared_id = f"chatcmpl-{uuid.uuid4().hex[:25]}"
+        shared_created = int(time.time())
+        shared_apim_request_id = f"chatcmpl-{uuid.uuid4().hex[:25]}"
+        
+        # Then yield all the choices objects
+        for delta_content in choices_objects:
+            yield ",\n"
+            completion_chunk = {
+                "id": shared_id,
+                "model": "gpt-4.1-mini-2025-04-14",
+                "created": shared_created,
+                "object": "chat.completion.chunk",
+                "choices": [
+                    {
+                        "messages": [
+                            {
+                                "role": "assistant",
+                                "content": delta_content
+                            }
+                        ]
+                    }
+                ],
+                "history_metadata": {},
+                "apim-request-id": shared_apim_request_id,
+                "delta": {
+                    "content": delta_content,
+                    "role": None
+                }
+            }
+            yield json.dumps(completion_chunk, ensure_ascii=False, cls=JSONEncoder)
+        
+        # Close the JSON array
+        yield "\n]"
+            
     except Exception as error:
         logging.exception("Exception while generating response stream: %s", error)
         yield json.dumps(error_dict(error))
@@ -230,14 +289,56 @@ async def chat(auth_claims: dict[str, Any]):
                 current_app.config[CONFIG_CHAT_HISTORY_COSMOS_ENABLED],
                 current_app.config[CONFIG_CHAT_HISTORY_BROWSER_ENABLED],
             )
+        
+        # Preprocess messages to handle new array content format
+        processed_messages = preprocess_messages(request_json["messages"])
+        
         result = await approach.run(
-            request_json["messages"],
+            processed_messages,
             context=context,
             session_state=session_state,
         )
         return jsonify(result)
     except Exception as error:
         return error_response(error, "/chat")
+
+
+def preprocess_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Preprocess messages to convert new array content format to string format
+    for backward compatibility with approaches.
+    
+    Converts:
+    "content": [{"type": "text", "text": "Hello"}]
+    
+    To:
+    "content": "Hello"
+    """
+    processed_messages = []
+    for message in messages:
+        processed_message = message.copy()
+        content = message.get("content")
+        
+        # If content is an array (new format), extract the text
+        if isinstance(content, list) and len(content) > 0:
+            # Look for the first text type content
+            for content_item in content:
+                if isinstance(content_item, dict) and content_item.get("type") == "text":
+                    processed_message["content"] = content_item.get("text", "")
+                    break
+            else:
+                # If no text type found, use empty string
+                processed_message["content"] = ""
+        # If content is already a string (old format), keep as is
+        elif isinstance(content, str):
+            processed_message["content"] = content
+        else:
+            # Handle any other case with empty string
+            processed_message["content"] = ""
+            
+        processed_messages.append(processed_message)
+    
+    return processed_messages
 
 
 @bp.route("/chat/stream", methods=["POST"])
@@ -259,8 +360,12 @@ async def chat_stream(auth_claims: dict[str, Any]):
                 current_app.config[CONFIG_CHAT_HISTORY_COSMOS_ENABLED],
                 current_app.config[CONFIG_CHAT_HISTORY_BROWSER_ENABLED],
             )
+        
+        # Preprocess messages to handle new array content format
+        processed_messages = preprocess_messages(request_json["messages"])
+        
         result = await approach.run_stream(
-            request_json["messages"],
+            processed_messages,
             context=context,
             session_state=session_state,
         )

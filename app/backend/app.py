@@ -210,34 +210,28 @@ class JSONEncoder(json.JSONEncoder):
 async def format_as_ndjson(r: AsyncGenerator[dict, None]) -> AsyncGenerator[str, None]:
     try:
         all_events = []
-        choices_objects = []
+        content_chunks = []
         
         # Collect all events first
         async for event in r:
             all_events.append(event)
             
-            # If this event has delta content, create a choices object
-            if "delta" in event and event["delta"].get("content"):
+            # If this event has delta content (not None), collect it for choices objects
+            if "delta" in event and "content" in event["delta"] and event["delta"]["content"] is not None:
                 delta_content = event["delta"]["content"]
-                choices_objects.append(delta_content)
-        
-        # Start the JSON array
-        yield "[\n"
-        
-        # First, yield all the original delta events
-        for i, event in enumerate(all_events):
-            if i > 0:
-                yield ",\n"
-            yield json.dumps(event, ensure_ascii=False, cls=JSONEncoder)
+                content_chunks.append(delta_content)
         
         # Generate shared values for all choices objects
         shared_id = f"chatcmpl-{uuid.uuid4().hex[:25]}"
         shared_created = int(time.time())
-        shared_apim_request_id = f"chatcmpl-{uuid.uuid4().hex[:25]}"
+        shared_apim_request_id = f"chatcmpl-{shared_id[9:]}"
         
-        # Then yield all the choices objects
-        for delta_content in choices_objects:
-            yield ",\n"
+        # First, yield all the original delta events
+        for event in all_events:
+            yield json.dumps(event, ensure_ascii=False, cls=JSONEncoder) + "\n"
+        
+        # Then yield all the choices objects at the end
+        for delta_content in content_chunks:
             completion_chunk = {
                 "id": shared_id,
                 "model": "gpt-4.1-mini-2025-04-14",
@@ -257,17 +251,14 @@ async def format_as_ndjson(r: AsyncGenerator[dict, None]) -> AsyncGenerator[str,
                 "apim-request-id": shared_apim_request_id,
                 "delta": {
                     "content": delta_content,
-                    "role": None
+                    "role": "assistant" if delta_content else None
                 }
             }
-            yield json.dumps(completion_chunk, ensure_ascii=False, cls=JSONEncoder)
-        
-        # Close the JSON array
-        yield "\n]"
+            yield json.dumps(completion_chunk, ensure_ascii=False, cls=JSONEncoder) + "\n"
             
     except Exception as error:
         logging.exception("Exception while generating response stream: %s", error)
-        yield json.dumps(error_dict(error))
+        yield json.dumps(error_dict(error)) + "\n"
 
 
 @bp.route("/chat", methods=["POST"])
@@ -369,10 +360,14 @@ async def chat_stream(auth_claims: dict[str, Any]):
             context=context,
             session_state=session_state,
         )
-        response = await make_response(format_as_ndjson(result))
-        response.timeout = None  # type: ignore
-        response.mimetype = "application/json-lines"
-        return response
+        
+        # Use Quart's proper streaming with immediate flushing
+        async def generate():
+            async for chunk in format_as_ndjson(result):
+                yield chunk
+        
+        from quart import Response
+        return Response(generate(), mimetype='text/plain', headers={'Cache-Control': 'no-cache'})
     except Exception as error:
         return error_response(error, "/chat")
 

@@ -1,6 +1,7 @@
 import json
 import re
 from collections.abc import AsyncGenerator, Awaitable
+from datetime import datetime
 from typing import Any, Optional, Union, cast
 
 from azure.search.documents.agent.aio import KnowledgeAgentRetrievalClient
@@ -242,6 +243,7 @@ class ChatReadRetrieveReadApproach(Approach):
                 "text_sources": extra_info.data_points.text,
                 "image_sources": extra_info.data_points.images,
                 "citations": extra_info.data_points.citations,
+                "current_datetime": datetime.now().strftime("%A, %B %d, %Y at %I:%M %p"),
             },
         )
 
